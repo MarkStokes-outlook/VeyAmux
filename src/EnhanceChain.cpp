@@ -1,3 +1,4 @@
+#include "FrameLayout.h"
 #include "EnhanceChain.h"
 #include "SmaaLookupTables.h"
 #include "../third_party/nis/NIS_Config.h"
@@ -511,6 +512,24 @@ bool EnhanceChain::ensureLive(int w, int h, int ow, int oh, std::string& error, 
 
 bool EnhanceChain::recordLive(VkCommandBuffer cb, int slot, const LiveInput& in, const EnhanceSettings& s, std::string& error,
                               float frameMs) {
+    PixelLayout format;
+    switch (in.fmt) {
+    case LiveInput::RGBA: format = PixelLayout::RGBA; break;
+    case LiveInput::YUYV: case LiveInput::UYVY: format = PixelLayout::Packed422; break;
+    case LiveInput::NV12: format = PixelLayout::NV12; break;
+    case LiveInput::P010: format = PixelLayout::P010; break;
+    default: error = "Unsupported live pixel layout"; return false;
+    }
+    FrameLayout layout;
+    if (!in.data || !validateFrame(format, in.w, in.h, in.stride, in.size, in.size, layout)) {
+        error = "Incomplete or invalid live capture planes"; return false;
+    }
+    VkPhysicalDeviceProperties properties{};
+    vkGetPhysicalDeviceProperties(ctx_.physical(), &properties);
+    if (uint32_t(in.w) > properties.limits.maxImageDimension2D ||
+        uint32_t(in.h) > properties.limits.maxImageDimension2D) {
+        error = "Live capture dimensions exceed device limits"; return false;
+    }
     frameMs_ = frameMs;
     int ow, oh;
     outputSize(in.w, in.h, s, ow, oh);
@@ -530,8 +549,11 @@ bool EnhanceChain::recordLive(VkCommandBuffer cb, int slot, const LiveInput& in,
         if (!rawY16_.image || !rawUV16_.image) { error = "Out of GPU memory for HDR capture"; return false; }
     }
     const int sl = ((slot % VkContext::kSlots) + VkContext::kSlots) % VkContext::kSlots;
-    const size_t bytes = std::min<size_t>(in.size, size_t(liveStagingSize_));
-    std::memcpy(liveStaging_[sl].mapped, in.data, bytes);
+    if (!packFrame(format, in.w, in.h, in.stride, in.data, in.size,
+                   liveStaging_[sl].mapped, size_t(liveStagingSize_))) {
+        error = "Live capture staging buffer is too small"; return false;
+    }
+    const uint32_t uploadStride = uint32_t(layout.planes[0].rowBytes);
 
     ctx_.beginExternal(cb, sl);
     timer_.begin(cb, sl);
@@ -566,16 +588,16 @@ bool EnhanceChain::recordLive(VkCommandBuffer cb, int slot, const LiveInput& in,
     };
     const uint32_t W = uint32_t(in.w), H = uint32_t(in.h);
     switch (in.fmt) {
-    case LiveInput::RGBA: copyTo(src_, 0, uint32_t(in.stride / 4), W, H); break;
+    case LiveInput::RGBA: copyTo(src_, 0, uint32_t(uploadStride / 4), W, H); break;
     case LiveInput::YUYV:
-    case LiveInput::UYVY: copyTo(rawPacked_, 0, uint32_t(in.stride / 4), W / 2, H); break;
+    case LiveInput::UYVY: copyTo(rawPacked_, 0, uint32_t(uploadStride / 4), W / 2, H); break;
     case LiveInput::NV12:
-        copyTo(rawY_, 0, uint32_t(in.stride), W, H);
-        copyTo(rawUV_, VkDeviceSize(in.stride) * H, uint32_t(in.stride / 2), W / 2, H / 2);
+        copyTo(rawY_, 0, uint32_t(uploadStride), W, H);
+        copyTo(rawUV_, VkDeviceSize(uploadStride) * H, uint32_t(uploadStride / 2), W / 2, H / 2);
         break;
     case LiveInput::P010:
-        copyTo(rawY16_, 0, uint32_t(in.stride / 2), W, H);
-        copyTo(rawUV16_, VkDeviceSize(in.stride) * H, uint32_t(in.stride / 4), W / 2, H / 2);
+        copyTo(rawY16_, 0, uint32_t(uploadStride / 2), W, H);
+        copyTo(rawUV16_, VkDeviceSize(uploadStride) * H, uint32_t(uploadStride / 4), W / 2, H / 2);
         break;
     }
     ctx_.computeBarrier();

@@ -194,6 +194,8 @@ target_link_libraries(veyamux-capture-test PRIVATE veyamux_media)
 enable_testing()
 add_executable(veyamux-capture-lease-test src/capture_lease_test.cpp)
 add_test(NAME capture-buffer-lease COMMAND veyamux-capture-lease-test)
+add_executable(veyamux-frame-layout-test src/frame_layout_test.cpp)
+add_test(NAME capture-frame-layout COMMAND veyamux-frame-layout-test)
 
 add_executable(veyamux-update-test src/update_test.cpp src/AppUpdate.cpp)
 target_link_libraries(veyamux-update-test PRIVATE Qt6::Core CURL::libcurl)

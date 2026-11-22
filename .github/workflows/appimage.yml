@@ -42,9 +42,15 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: ./scripts/build-appimage.sh
 
-      - name: Test V4L2 buffer ownership
+      - name: Test V4L2 buffer ownership and plane layouts
         working-directory: ${{ env.SRC }}
-        run: ctest --test-dir build --output-on-failure -R '^capture-buffer-lease$' --no-tests=error
+        run: ctest --test-dir build --output-on-failure -R '^capture-(buffer-lease|frame-layout)$' --no-tests=error
+
+      - name: Test capture layouts with sanitizers
+        working-directory: ${{ env.SRC }}
+        run: |
+          g++ -std=c++20 -g -O1 -fno-omit-frame-pointer -fsanitize=address,undefined src/frame_layout_test.cpp -o /tmp/veyamux-frame-layout-sanitize
+          /tmp/veyamux-frame-layout-sanitize
 
       - uses: actions/upload-artifact@v4
         with:

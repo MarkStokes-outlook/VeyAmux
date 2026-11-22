@@ -1,4 +1,5 @@
 #include "CaptureSource.h"
+#include "FrameLayout.h"
 #include "DemoSource.h"
 #include "RemotePlay.h"
 #include "ScreenCast.h"
@@ -84,6 +85,16 @@ AVPixelFormat pixFmtFor(uint32_t f) {
     case V4L2_PIX_FMT_RGB24: return AV_PIX_FMT_RGB24;
     case V4L2_PIX_FMT_BGR24: return AV_PIX_FMT_BGR24;
     default: return AV_PIX_FMT_NONE;
+    }
+}
+bool captureLayout(uint32_t f, PixelLayout& layout) {
+    switch (f) {
+    case V4L2_PIX_FMT_YUYV: case V4L2_PIX_FMT_UYVY: layout = PixelLayout::Packed422; return true;
+    case V4L2_PIX_FMT_NV12: layout = PixelLayout::NV12; return true;
+    case V4L2_PIX_FMT_P010: layout = PixelLayout::P010; return true;
+    case V4L2_PIX_FMT_YUV420: layout = PixelLayout::I420; return true;
+    case V4L2_PIX_FMT_RGB24: case V4L2_PIX_FMT_BGR24: layout = PixelLayout::RGB24; return true;
+    default: return false;
     }
 }
 bool isMjpeg(uint32_t f) { return f == V4L2_PIX_FMT_MJPEG || f == V4L2_PIX_FMT_JPEG; }
@@ -214,17 +225,30 @@ FrameConverter::~FrameConverter() {
 }
 
 bool FrameConverter::init(uint32_t fourcc, int w, int h, int stride, std::string& error) {
+    sws_freeContext(sws_); sws_ = nullptr;
+    avcodec_free_context(&mjpeg_);
+    av_frame_free(&frame_);
+    av_packet_free(&pkt_);
+    if (w <= 0 || h <= 0 || w > INT_MAX / 4 || size_t(w) * h > size_t(INT_MAX) / 4) {
+        error = "Invalid capture dimensions"; return false;
+    }
+    PixelLayout format; FrameLayout layout;
+    if (!isMjpeg(fourcc) && (!captureLayout(fourcc, format) || !describeFrame(format, w, h, stride, layout))) {
+        error = "Invalid capture plane layout"; return false;
+    }
     fourcc_ = fourcc; w_ = w; h_ = h; stride_ = stride;
     if (isMjpeg(fourcc)) {
         const AVCodec* c = avcodec_find_decoder(AV_CODEC_ID_MJPEG);
         if (!c) { error = "FFmpeg has no MJPEG decoder"; return false; }
         mjpeg_ = avcodec_alloc_context3(c);
+        if (!mjpeg_) { error = "Could not allocate MJPEG decoder"; return false; }
         mjpeg_->thread_count = 2;
         mjpeg_->thread_type = FF_THREAD_SLICE;     // frame threading would add latency
         mjpeg_->flags |= AV_CODEC_FLAG_LOW_DELAY;
         if (avcodec_open2(mjpeg_, c, nullptr) < 0) { error = "Could not open the MJPEG decoder"; return false; }
         frame_ = av_frame_alloc();
         pkt_ = av_packet_alloc();
+        if (!frame_ || !pkt_) { error = "Could not allocate MJPEG frame/packet"; return false; }
     } else if (pixFmtFor(fourcc) == AV_PIX_FMT_NONE) {
         error = "Unsupported pixel format " + fourccName(fourcc);
         return false;
@@ -233,33 +257,36 @@ bool FrameConverter::init(uint32_t fourcc, int w, int h, int stride, std::string
 }
 
 bool FrameConverter::convert(const uint8_t* data, size_t size, std::vector<uint8_t>& rgba, std::string& error) {
+    if (!data || size == 0) { error = "Empty capture frame"; return false; }
     const uint8_t* planes[4] = {nullptr, nullptr, nullptr, nullptr};
     int lines[4] = {0, 0, 0, 0};
     AVPixelFormat fmt;
     int range = fullRange_ ? 1 : 0;
     int w = w_, h = h_;
     if (mjpeg_) {
-        pkt_->data = const_cast<uint8_t*>(data);
-        pkt_->size = int(size);
+        av_packet_unref(pkt_);
+        if (size > size_t(INT_MAX - AV_INPUT_BUFFER_PADDING_SIZE) || av_new_packet(pkt_, int(size)) < 0) {
+            error = "Could not allocate padded MJPEG packet"; return false;
+        }
+        // av_new_packet owns and zeroes AV_INPUT_BUFFER_PADDING_SIZE trailing bytes.
+        std::memcpy(pkt_->data, data, size);
         if (avcodec_send_packet(mjpeg_, pkt_) < 0 || avcodec_receive_frame(mjpeg_, frame_) < 0) {
             error = "Corrupt MJPEG frame";
             return false;
         }
         w = frame_->width; h = frame_->height; fmt = AVPixelFormat(frame_->format);
+        if (w != w_ || h != h_) { error = "MJPEG dimensions differ from capture mode"; return false; }
         for (int i = 0; i < 4; ++i) { planes[i] = frame_->data[i]; lines[i] = frame_->linesize[i]; }
         range = (frame_->color_range == AVCOL_RANGE_MPEG) ? 0 : 1;   // JPEG is full range unless flagged
     } else {
         fmt = pixFmtFor(fourcc_);
-        const int bpl = stride_;
-        switch (fourcc_) {
-        case V4L2_PIX_FMT_NV12:
-        case V4L2_PIX_FMT_P010:
-            planes[0] = data; lines[0] = bpl; planes[1] = data + size_t(bpl) * h; lines[1] = bpl; break;
-        case V4L2_PIX_FMT_YUV420:
-            planes[0] = data; lines[0] = bpl;
-            planes[1] = data + size_t(bpl) * h; lines[1] = bpl / 2;
-            planes[2] = planes[1] + size_t(bpl / 2) * (h / 2); lines[2] = bpl / 2; break;
-        default: planes[0] = data; lines[0] = bpl; break;
+        PixelLayout format; FrameLayout layout;
+        if (!captureLayout(fourcc_, format) || !validateFrame(format, w, h, stride_, size, size, layout)) {
+            error = "Incomplete or invalid capture planes"; return false;
+        }
+        for (size_t i = 0; i < layout.count; ++i) {
+            planes[i] = data + layout.planes[i].offset;
+            lines[i] = int(layout.planes[i].stride);
         }
         if (fmt == AV_PIX_FMT_RGB24 || fmt == AV_PIX_FMT_BGR24) range = 1;
     }
@@ -344,10 +371,18 @@ bool CaptureSource::open(const std::string& path, const CaptureMode& mode, std::
         return false;
     }
     if (fmt.fmt.pix.pixelformat != mode.fourcc) { error = "The device refused pixel format " + fourccName(mode.fourcc); close(); return false; }
+    if (fmt.fmt.pix.width == 0 || fmt.fmt.pix.height == 0 || fmt.fmt.pix.width > INT_MAX / 4 ||
+        fmt.fmt.pix.height > INT_MAX || fmt.fmt.pix.bytesperline > INT_MAX) {
+        error = "Invalid negotiated capture dimensions or stride"; close(); return false;
+    }
     w_ = int(fmt.fmt.pix.width); h_ = int(fmt.fmt.pix.height);
     fourcc_ = mode.fourcc;
     rawStride_ = int(fmt.fmt.pix.bytesperline);
-    if (rawStride_ <= 0) rawStride_ = fourcc_ == V4L2_PIX_FMT_NV12 ? w_ : w_ * 2;   // NV12 1, P010/YUYV/UYVY 2 bytes per luma
+    if (!rawStride_) {
+        const int bpp = (fourcc_ == V4L2_PIX_FMT_NV12 || fourcc_ == V4L2_PIX_FMT_YUV420) ? 1 :
+                        (fourcc_ == V4L2_PIX_FMT_RGB24 || fourcc_ == V4L2_PIX_FMT_BGR24) ? 3 : 2;
+        rawStride_ = w_ * bpp;
+    }
 
     v4l2_streamparm parm{};
     parm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
@@ -356,7 +391,7 @@ bool CaptureSource::open(const std::string& path, const CaptureMode& mode, std::
         fps_ = double(parm.parm.capture.timeperframe.denominator) / parm.parm.capture.timeperframe.numerator;
     else fps_ = mode.fps;
 
-    if (!conv_.init(mode.fourcc, w_, h_, int(fmt.fmt.pix.bytesperline ? fmt.fmt.pix.bytesperline : w_ * 2), error)) { close(); return false; }
+    if (!conv_.init(mode.fourcc, w_, h_, rawStride_, error)) { close(); return false; }
 
     v4l2_requestbuffers req{};
     // 6: the renderer may hold two (the newest and the one on screen) without starving the card
@@ -422,7 +457,9 @@ void CaptureSource::probeRaw(const v4l2_buffer& b) {
     if ((b.flags & V4L2_BUF_FLAG_ERROR) || b.index >= bufs_.size()) return;
     const auto* src = static_cast<const uint8_t*>(bufs_[b.index].start);
     if (!src || rawStride_ <= 0) return;
-    if (b.bytesused < size_t(rawStride_) * h_) return;
+    PixelLayout format; FrameLayout layout;
+    if (!captureLayout(fourcc_, format) ||
+        !validateFrame(format, w_, h_, rawStride_, b.bytesused, bufs_[b.index].length, layout)) return;
     const uint8_t* luma = nullptr;
     int step = 2;
     if (fourcc_ == V4L2_PIX_FMT_NV12) { luma = src; step = 1; }
@@ -510,7 +547,7 @@ CaptureSource::Result CaptureSource::read(std::vector<uint8_t>& rgba, int timeou
     std::string e;
     if (!dequeueNewest(b, lease, e)) { if (!e.empty()) { error = e; return Result::Error; } return Result::Timeout; }
     Result res = Result::Timeout;
-    if (!(b.flags & V4L2_BUF_FLAG_ERROR) && b.bytesused > 0 && b.index < bufs_.size()) {
+    if (!(b.flags & V4L2_BUF_FLAG_ERROR) && b.bytesused > 0 && b.index < bufs_.size() && b.bytesused <= bufs_[b.index].length) {
         std::string ce;
         if (conv_.convert(static_cast<const uint8_t*>(bufs_[b.index].start), b.bytesused, rgba, ce)) {
             res = Result::Frame;
@@ -559,15 +596,15 @@ CaptureSource::Result CaptureSource::readLatest(RawFrame& out, int timeoutMs, st
     if (!dequeueNewest(b, lease, e)) { if (!e.empty()) { error = e; return Result::Error; } return Result::Timeout; }
     Result res = Result::Timeout;
     out.captured = captureTime(b);
-    if (!(b.flags & V4L2_BUF_FLAG_ERROR) && b.bytesused > 0 && b.index < bufs_.size()) {
+    if (!(b.flags & V4L2_BUF_FLAG_ERROR) && b.bytesused > 0 && b.index < bufs_.size() && b.bytesused <= bufs_[b.index].length) {
         const uint8_t* src = static_cast<const uint8_t*>(bufs_[b.index].start);
         const size_t len = b.bytesused;
         const bool p010 = fourcc_ == V4L2_PIX_FMT_P010;
         const bool raw = fourcc_ == V4L2_PIX_FMT_YUYV || fourcc_ == V4L2_PIX_FMT_UYVY || fourcc_ == V4L2_PIX_FMT_NV12 || p010;
         if (raw) {
-            const bool planar = fourcc_ == V4L2_PIX_FMT_NV12 || p010;
-            const size_t need = planar ? size_t(rawStride_) * h_ * 3 / 2 : size_t(rawStride_) * h_;
-            if (len >= need) {
+            PixelLayout format; FrameLayout layout;
+            if (captureLayout(fourcc_, format) && validateFrame(format, w_, h_, rawStride_, len, bufs_[b.index].length, layout)) {
+                const size_t need = layout.requiredBytes;
                 out.fmt = fourcc_ == V4L2_PIX_FMT_YUYV ? RawFrame::YUYV : fourcc_ == V4L2_PIX_FMT_UYVY ? RawFrame::UYVY
                         : p010 ? RawFrame::P010 : RawFrame::NV12;
                 static const bool forceCopy = std::getenv("VEYAMUX_CAPTURE_COPY") != nullptr;   // the old way, to compare
