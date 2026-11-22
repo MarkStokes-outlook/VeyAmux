@@ -384,6 +384,7 @@ public:
         if (rec_ && rec_->recording()) rec_->stopRecording();
         obs_.stop();
         engine_.close();
+        if (liveVk_) liveVk_->setActive(false);
         QSettings().remove("lsfg/launching");   // a normal quit is not a crash, however early
     }
     bool liveVulkanActive() const { return liveVk_ && liveVk_->active(); }

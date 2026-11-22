@@ -122,12 +122,16 @@ void LiveVulkan::setSettings(const EnhanceSettings& s) {
 }
 
 void LiveVulkan::setActive(bool on) {
-    active_ = on;
-    emit outputChanged();
-    if (!on) {
+    {
         std::lock_guard l(m_);
-        hasNew_ = haveCurrent_ = redraw_ = false;
+        active_ = on;
+        if (!on) {
+            mailbox_.captureBuffer.reset();
+            current_.captureBuffer.reset();
+            hasNew_ = haveCurrent_ = redraw_ = false;
+        }
     }
+    emit outputChanged();
     QMetaObject::invokeMethod(win_, "update", Qt::QueuedConnection);
 }
 
@@ -145,14 +149,16 @@ void LiveVulkan::submit(RawFrame& frame) {
 }
 
 void LiveVulkan::onBeforeRendering() {
-    if (!active_.load()) return;
     bool fresh = false;
     EnhanceSettings s;
+    RawFrame frame;
     {
         std::lock_guard l(m_);
+        if (!active_.load()) return;
         s = settings_;
         if (hasNew_) {
             std::swap(current_, mailbox_);
+            mailbox_.captureBuffer.reset();   // the old picture is no longer needed for redraw
             hasNew_ = false;
             haveCurrent_ = true;
             redraw_ = false;
@@ -161,6 +167,8 @@ void LiveVulkan::onBeforeRendering() {
             redraw_ = false;
             fresh = true;
         }
+        // Keep the pixels alive through the staging upload if the source closes during rendering.
+        if (fresh) frame = std::move(current_);
     }
     if (!fresh) {
         // FSR frame generation: the generated frame is on screen; the real one follows half a frame later
@@ -176,19 +184,20 @@ void LiveVulkan::onBeforeRendering() {
     }
 
     const auto t0 = std::chrono::steady_clock::now();
-    if (current_.reset) { chain_->resetHistory(); current_.reset = false; }   // a video file was seeked
+    if (frame.reset) { chain_->resetHistory(); frame.reset = false; }   // a video file was seeked
     LiveInput in;
-    switch (current_.fmt) {
+    switch (frame.fmt) {
     case RawFrame::YUYV: in.fmt = LiveInput::YUYV; break;
     case RawFrame::UYVY: in.fmt = LiveInput::UYVY; break;
     case RawFrame::NV12: in.fmt = LiveInput::NV12; break;
     case RawFrame::P010: in.fmt = LiveInput::P010; break;
     default: in.fmt = LiveInput::RGBA; break;
     }
-    in.data = current_.bytes();
-    in.size = current_.size();
-    in.w = current_.w; in.h = current_.h; in.stride = current_.stride;
-    in.time = current_.captured.time_since_epoch().count() ? current_.captured : std::chrono::steady_clock::now();
+    in.data = frame.bytes();
+    in.size = frame.size();
+    in.w = frame.w; in.h = frame.h; in.stride = frame.stride;
+    const auto captured = frame.captured;
+    in.time = captured.time_since_epoch().count() ? captured : std::chrono::steady_clock::now();
 
     win_->beginExternalCommands();
     auto* rif = win_->rendererInterface();
@@ -199,15 +208,16 @@ void LiveVulkan::onBeforeRendering() {
     s.fitW = fitW_.load(); s.fitH = fitH_.load();   // the window's pixel size for the picture (VideoItem)
     bool ok = cb && *cb && chain_->recordLive(*cb, win_->graphicsStateInfo().currentFrameSlot, in, s, err, float(frameMs));
     win_->endExternalCommands();
-    if (!ok) {
-        std::lock_guard l(m_);
-        error_ = err.empty() ? "Live path unavailable" : err;
-        static int warned = 0;
-        if (warned++ < 3) qWarning() << "LiveVulkan: record failed:" << QString::fromStdString(error_);
-        return;
-    }
     {
         std::lock_guard l(m_);
+        if (!haveCurrent_) return;   // the source closed while rendering
+        current_ = std::move(frame);  // retain the current picture for a paused redraw
+        if (!ok) {
+            error_ = err.empty() ? "Live path unavailable" : err;
+            static int warned = 0;
+            if (warned++ < 3) qWarning() << "LiveVulkan: record failed:" << QString::fromStdString(error_);
+            return;
+        }
         error_.clear();
         upError_ = chain_->fgError().empty() ? chain_->upError() : "Frame generation: " + chain_->fgError();
     }
@@ -221,8 +231,8 @@ void LiveVulkan::onBeforeRendering() {
         gpuMs_ = chain_->gpuMs();
         gpuStages_ = chain_->gpuStageMs();
     }
-    if (current_.captured.time_since_epoch().count()) {
-        const double q = std::chrono::duration<double, std::milli>(tEnd - current_.captured).count();
+    if (captured.time_since_epoch().count()) {
+        const double q = std::chrono::duration<double, std::milli>(tEnd - captured).count();
         if (q >= 0 && q < 1000) {
             const double g = std::max(0.0f, chain_->gpuMs());
             const double v = q + g, o = pipeMs_.load();
