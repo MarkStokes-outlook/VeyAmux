@@ -42,6 +42,10 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: ./scripts/build-appimage.sh
 
+      - name: Test V4L2 buffer ownership
+        working-directory: ${{ env.SRC }}
+        run: ctest --test-dir build --output-on-failure -R '^capture-buffer-lease$' --no-tests=error
+
       - uses: actions/upload-artifact@v4
         with:
           name: VeyAmux-x86_64.AppImage

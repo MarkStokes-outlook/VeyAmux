@@ -1089,7 +1089,7 @@ void MediaEngine::pacerLoop() {
         paced_.pop_front();
         l.unlock();
         if (cb_.onLiveFrame) cb_.onLiveFrame(f);   // f now holds a used buffer
-        f.hold.reset(); f.ext = nullptr;           // a driver buffer goes back to the card
+        f.captureBuffer.reset();                 // a driver buffer goes back to the card
         l.lock();
         if (paceSpare_.size() < 3) paceSpare_.push_back(std::move(f));
     }

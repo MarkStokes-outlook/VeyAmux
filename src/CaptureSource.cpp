@@ -385,6 +385,16 @@ CaptureSource::Mapping::~Mapping() {
     for (auto& b : bufs) if (b.start) munmap(b.start, b.length);
 }
 
+void CaptureSource::Mapping::requeue(uint32_t index) noexcept {
+    std::lock_guard l(m);
+    if (!live) return;
+    v4l2_buffer b{};
+    b.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    b.memory = V4L2_MEMORY_MMAP;
+    b.index = index;
+    xioctl(fd, VIDIOC_QBUF, &b);
+}
+
 void CaptureSource::close() {
     sc_.reset();
     demo_.reset();
@@ -434,7 +444,7 @@ void CaptureSource::probeRgba(const std::vector<uint8_t>& rgba) {
     if (rgba.size() >= size_t(w_) * h_ * 4) probe_.feed(rgba.data() + 1, w_, h_, w_ * 4, 4, std::chrono::steady_clock::now());   // green ~ luma
 }
 
-bool CaptureSource::dequeueNewest(v4l2_buffer& held, std::string& error) {
+bool CaptureSource::dequeueNewest(v4l2_buffer& held, CaptureBufferLease& lease, std::string& error) {
     bool got = false;
     for (size_t i = 0; i <= bufs_.size(); ++i) {
         v4l2_buffer b{};
@@ -446,7 +456,7 @@ bool CaptureSource::dequeueNewest(v4l2_buffer& held, std::string& error) {
             return false;
         }
         probeRaw(b);                                    // every delivered frame, including ones dropped for latency
-        if (got) xioctl(fd_, VIDIOC_QBUF, &held);      // a newer frame exists: hand the stale buffer straight back
+        lease = CaptureBufferLease{map_, b.index};      // replacing the lease returns the stale buffer
         held = b;
         got = true;
     }
@@ -496,8 +506,9 @@ CaptureSource::Result CaptureSource::read(std::vector<uint8_t>& rgba, int timeou
     if (r < 0) { if (errno == EINTR) return Result::Timeout; error = std::strerror(errno); return Result::Error; }
     if (p.revents & (POLLERR | POLLHUP | POLLNVAL)) { error = "Capture device disconnected"; return Result::Error; }
     v4l2_buffer b{};
+    CaptureBufferLease lease;
     std::string e;
-    if (!dequeueNewest(b, e)) { if (!e.empty()) { error = e; return Result::Error; } return Result::Timeout; }
+    if (!dequeueNewest(b, lease, e)) { if (!e.empty()) { error = e; return Result::Error; } return Result::Timeout; }
     Result res = Result::Timeout;
     if (!(b.flags & V4L2_BUF_FLAG_ERROR) && b.bytesused > 0 && b.index < bufs_.size()) {
         std::string ce;
@@ -507,14 +518,11 @@ CaptureSource::Result CaptureSource::read(std::vector<uint8_t>& rgba, int timeou
             lastRepeat_ = !delivered_.changed(rgba.data() + 1, w_, h_, w_ * 4, 4, true);
         }
     }
-    xioctl(fd_, VIDIOC_QBUF, &b);
     return res;
 }
 
 CaptureSource::Result CaptureSource::readLatest(RawFrame& out, int timeoutMs, std::string& error) {
-    out.hold.reset();   // a driver buffer this (recycled) frame still held goes back to the card
-    out.ext = nullptr;
-    out.extSize = 0;
+    out.captureBuffer.reset();   // return any borrowed buffer from the recycled frame
     if (ps_) {
         out.repeat = false;
         const auto r = ps_->readLatest(out, timeoutMs, error);
@@ -546,8 +554,9 @@ CaptureSource::Result CaptureSource::readLatest(RawFrame& out, int timeoutMs, st
     if (r < 0) { if (errno == EINTR) return Result::Timeout; error = std::strerror(errno); return Result::Error; }
     if (p.revents & (POLLERR | POLLHUP | POLLNVAL)) { error = "Capture device disconnected"; return Result::Error; }
     v4l2_buffer b{};
+    CaptureBufferLease lease;
     std::string e;
-    if (!dequeueNewest(b, e)) { if (!e.empty()) { error = e; return Result::Error; } return Result::Timeout; }
+    if (!dequeueNewest(b, lease, e)) { if (!e.empty()) { error = e; return Result::Error; } return Result::Timeout; }
     Result res = Result::Timeout;
     out.captured = captureTime(b);
     if (!(b.flags & V4L2_BUF_FLAG_ERROR) && b.bytesused > 0 && b.index < bufs_.size()) {
@@ -561,20 +570,15 @@ CaptureSource::Result CaptureSource::readLatest(RawFrame& out, int timeoutMs, st
             if (len >= need) {
                 out.fmt = fourcc_ == V4L2_PIX_FMT_YUYV ? RawFrame::YUYV : fourcc_ == V4L2_PIX_FMT_UYVY ? RawFrame::UYVY
                         : p010 ? RawFrame::P010 : RawFrame::NV12;
-                // no copy here: the renderer copies straight from the driver's buffer into the GPU upload buffer
-                // (only with enough buffers: the renderer may hold two, the card must keep at least three)
                 static const bool forceCopy = std::getenv("VEYAMUX_CAPTURE_COPY") != nullptr;   // the old way, to compare
-                if (bufs_.size() < 5 || !map_ || forceCopy) {
+                // This thread is the only one that takes leases. Count this one too, so even with pacing enabled
+                // at least three buffers go back to the driver. The extra reference belongs to CaptureSource.
+                const size_t leased = size_t(map_.use_count() - 1);
+                if (bufs_.size() < 5 || leased > bufs_.size() - 3 || forceCopy) {
                     out.data.assign(src, src + need);
                 } else {
-                    out.ext = src;
-                    out.extSize = need;
-                    auto map = map_;
-                    v4l2_buffer keep = b;
-                    out.hold = std::shared_ptr<void>(nullptr, [map, keep](void*) mutable {
-                        std::lock_guard l(map->m);
-                        if (map->live) xioctl(map->fd, VIDIOC_QBUF, &keep);
-                    });
+                    lease.setPixels({src, need});
+                    out.captureBuffer = std::move(lease);
                 }
                 out.w = w_; out.h = h_; out.stride = rawStride_;
                 // luma bytes for repeat detection: NV12 every byte, YUYV every 2nd, UYVY every 2nd from 1, P010 the high bytes
@@ -595,7 +599,6 @@ CaptureSource::Result CaptureSource::readLatest(RawFrame& out, int timeoutMs, st
             }
         }
     }
-    if (!out.hold) xioctl(fd_, VIDIOC_QBUF, &b);   // a held buffer is queued again when its frame is dropped
     return res;
 }
 

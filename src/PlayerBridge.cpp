@@ -941,6 +941,7 @@ bool PlayerBridge::openPath(const QString& path) {
     std::string err;
     openFile_ = path;
     demoActive_ = false;
+    engine_.close();
     if (liveVk_) liveVk_->setActive(false);
     { QMutexLocker l(&imgMutex_); image_ = QImage(); }
     // the picture goes straight to the window's Vulkan frame when it can (VEYAMUX_FILE_GPU=0: the CPU way)
@@ -1357,6 +1358,7 @@ bool PlayerBridge::startCapture(const QString& path, const veyamux::CaptureMode&
     veyamux::demo::releaseAll();
     if (!screenCast && portal_) portal_->closeSession();   // a capture card replaces the shared window
     std::string err;
+    engine_.close();
     { QMutexLocker l(&imgMutex_); image_ = QImage(); }
     if (liveVk_) liveVk_->setActive(false);
     const bool zeroCopy = liveVk_ != nullptr;
@@ -1614,6 +1616,7 @@ void PlayerBridge::restartWithSource() {
     else if (engine_.isOpen() && !openFile_.isEmpty()) args << openFile_;
     if (window_ && window_->visibility() == QWindow::FullScreen) args << "--fullscreen";
     engine_.close();   // release the capture card before the new instance opens it
+    if (liveVk_) liveVk_->setActive(false);
     QSettings().sync();
     if (QProcess::startDetached(target, args)) QCoreApplication::quit();
     else { lsfgOffPending_ = false; showNotice(L("Restart VeyAmux to turn Lossless Scaling off", "Genstart VeyAmux for at slå Lossless Scaling fra")); }
@@ -1627,6 +1630,7 @@ void PlayerBridge::restartApp() {
     args.removeAll("--probe-ui");
     // Release the capture card (and audio) BEFORE the new instance starts, or it gets "device busy".
     engine_.close();
+    if (liveVk_) liveVk_->setActive(false);
     QSettings().sync();
     if (QProcess::startDetached(target, args)) QCoreApplication::quit();
 }
